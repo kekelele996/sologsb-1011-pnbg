@@ -2,14 +2,21 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  advancePlayheadModel,
   cloneModel,
+  completeMachineRoomLog,
   createInitialModel,
-  mergeConfirmedSegments,
+  findEntry,
   normalizeNumbers,
+  parseSlot,
+  queueCorrection,
   queueStats,
+  reconcileWithMachineRoom,
+  repackQueuedCorrections,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
+  type BroadcastWindow,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
@@ -34,10 +41,12 @@ function formatAge(timestamp: number): string {
 function stateLabel(state: SegmentState): string {
   return {
     pending: '待确认',
-    confirmed: '已确认',
+    confirmed: '已排入窗口',
     duplicate: '重复片段',
     stale: '过期修改',
     ignored: '已忽略',
+    suspended: '日志挂起',
+    aired: '已上屏 · 锁定',
   }[state];
 }
 
@@ -162,18 +171,25 @@ export class CaptionDesk extends LitElement {
     .segment-card.duplicate { border-left-color: #a56eff; }
     .segment-card.stale { border-left-color: #f1c21b; background: color-mix(in srgb, #fff 92%, #f1c21b 8%); }
     .segment-card.confirmed { border-left-color: #42be65; }
+    .segment-card.suspended { border-left-color: #ff832b; background: color-mix(in srgb, #fff 93%, #ff832b 7%); }
+    .segment-card.aired { border-left-color: #393939; opacity: .92; }
     .segment-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
     .segment-meta > span:first-child { color: var(--cds-text-secondary, #525252); font: 500 10px/1 "IBM Plex Mono", monospace; }
     .segment-state { font-size: 10px; color: #525252; }
     .segment-state.stale { color: #8d6e00; }
     .segment-state.duplicate { color: #6929c4; }
     .segment-state.confirmed { color: #198038; }
+    .segment-state.suspended { color: #9c4f00; }
+    .segment-state.aired { color: #525252; }
     .segment-text { margin: 0; font-size: var(--caption-font-size); line-height: 1.5; }
     .segment-corrected { margin: 6px 0 0; padding-left: 8px; border-left: 2px solid #42be65; color: #198038; font-size: calc(var(--caption-font-size) * .88); line-height: 1.45; }
     .segment-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
     .segment-foot b { color: #0f62fe; font-weight: 500; }
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
+    .suspended-note { background: #fff2e8; border-color: #ff832b; color: #7a3500; }
+    .locked-note { background: #f4f4f4; border-color: #8d8d8d; color: #393939; }
+    .segment-corrected.locked { border-left-color: #8d8d8d; color: #525252; }
 
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
@@ -188,6 +204,8 @@ export class CaptionDesk extends LitElement {
     .editor-form { padding: 14px; display: flex; flex-direction: column; gap: 13px; }
     .form-grid { display: grid; grid-template-columns: minmax(130px, .6fr) 1fr; gap: 12px; align-items: end; }
     .caption-input { min-height: 158px; --cds-body-compact-01-font-size: var(--caption-font-size); --cds-body-compact-02-font-size: var(--caption-font-size); }
+    .aired-box { padding: 10px 12px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #525252; font-size: calc(var(--caption-font-size) * .9); }
+    .aired-box span { color: var(--cds-text-secondary, #525252); font-size: 10px; }
     .edit-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .edit-toolbar > span { margin-right: 5px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
     .number-input { width: 110px; }
@@ -211,12 +229,41 @@ export class CaptionDesk extends LitElement {
     .rule-form { padding: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .rule-form cds-text-input, .rule-form cds-button { width: 100%; }
     .rule-form .full { grid-column: 1 / -1; }
-    .live-timeline { padding: 6px 0; }
-    .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
-    .live-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
-    .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
-    .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
-    .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .air-log { max-height: 220px; overflow: auto; padding: 6px 0; }
+    .air-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
+    .air-item.drifted { border-left-color: #ff832b; }
+    .air-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
+    .air-item.drifted time { color: #9c4f00; }
+    .air-item p { margin: 5px 0 0; font-size: calc(var(--caption-font-size) * .72); line-height: 1.45; }
+    .air-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .inspector-action { padding: 8px 10px 10px; border-top: 1px solid var(--cds-border-subtle, #e0e0e0); }
+
+    .window-board { padding: 8px 10px; display: flex; flex-direction: column; gap: 7px; }
+    .window-row { padding: 8px 9px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #8d8d8d; }
+    .window-row.live { border-left-color: #0f62fe; outline: 1px solid #78a9ff; }
+    .window-row.past { opacity: .75; }
+    .window-meta { display: flex; align-items: baseline; gap: 8px; }
+    .window-meta strong { font-size: 11px; }
+    .window-meta span { font: 10px/1 "IBM Plex Mono", monospace; color: var(--cds-text-secondary, #525252); }
+    .window-meta em { margin-left: auto; font-style: normal; font-size: 10px; color: var(--cds-text-secondary, #525252); }
+    .slot-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+    .slot-chip { font: 500 9px/1 "IBM Plex Mono", monospace; padding: 4px 6px; border: 1px solid #8d8d8d; color: inherit; background: var(--cds-layer, #fff); white-space: nowrap; }
+    .slot-chip.delivery { border-color: #42be65; color: #198038; }
+    .slot-chip.correction { border-color: #ff832b; color: #9c4f00; background: #fff2e8; }
+    .slot-chip.free { border-style: dashed; color: #8d8d8d; }
+    .slot-chip.past { background: #e8e8e8; }
+
+    .correction-list { padding: 6px 0; }
+    .correction-item { margin: 0 10px 7px; padding: 8px 10px; border-left: 3px solid #ff832b; background: var(--cds-layer-02, #f4f4f4); }
+    .correction-item.scheduled { border-left-color: #0f62fe; }
+    .correction-item.delivered { border-left-color: #42be65; opacity: .8; }
+    .correction-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .correction-head strong { font-size: 11px; }
+    .correction-status { font-size: 9px; color: #9c4f00; white-space: nowrap; }
+    .correction-status.scheduled { color: #0043ce; }
+    .correction-status.delivered { color: #198038; }
+    .correction-item p { margin: 5px 0 0; font-size: calc(var(--caption-font-size) * .72); line-height: 1.45; }
+    .correction-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -273,7 +320,7 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length && parsed.windows && parsed.machineEntries) return parsed;
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -335,8 +382,8 @@ export class CaptionDesk extends LitElement {
 
   private get pendingSegments(): CaptionSegment[] {
     const items = this.model.segments.filter((item) => {
-      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
-      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
+      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate' || item.state === 'suspended';
+      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate' || item.state === 'suspended';
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
@@ -436,6 +483,14 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
+    if (selected.state === 'aired') {
+      this.queueCorrectionForSelected();
+      return;
+    }
+    if (selected.state === 'suspended') {
+      this.pushToast('warning', '机房日志未补齐', '该段落先挂起，等机房补齐播出日志后再对账');
+      return;
+    }
     const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
@@ -485,14 +540,58 @@ export class CaptionDesk extends LitElement {
     }));
   }
 
-  private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
-    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+  private reconcile(): void {
+    const previous = cloneModel(this.model);
+    const { model: reconciled, report } = reconcileWithMachineRoom(this.model);
+    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
     this.future = [];
-    this.model = merged;
+    this.model = reconciled;
     this.persist();
-    const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    const details: string[] = [];
+    if (report.aired) details.push(`机房已上屏 ${report.aired} 段（已锁定，不可回改）`);
+    if (report.correctionCreated) details.push(`生成 ${report.correctionCreated} 条追改`);
+    if (report.correctionScheduled) details.push(`${report.correctionScheduled} 条已排入后续窗口`);
+    if (report.deliveriesScheduled) details.push(`${report.deliveriesScheduled} 段正常投递已排窗`);
+    if (report.suspended) details.push(`${report.suspended} 段等机房补日志继续挂起`);
+    if (report.overflow) details.push(`${report.overflow} 项本档装不下，已顺延`);
+    this.pushToast(
+      report.suspended || report.overflow ? 'warning' : 'success',
+      '与机房对账完成',
+      details.join('；') || '两边内容一致，无需追改',
+    );
+  }
+
+  private completeMachineLogs(): void {
+    const suspended = this.model.segments.filter((item) => item.state === 'suspended').map((item) => item.id);
+    if (!suspended.length) {
+      this.pushToast('info', '没有待补的机房日志', '所有挂起段落都已拿到机房播出记录');
+      return;
+    }
+    const previous = cloneModel(this.model);
+    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = completeMachineRoomLog(this.model, suspended);
+    this.persist();
+    this.pushToast('success', '机房播出日志已补齐', `${suspended.length} 段重新对账，错过窗口的改动已转追改排进后续窗口`);
+  }
+
+  private queueCorrectionForSelected(): void {
+    const selected = this.selected;
+    if (!selected || !selected.airedText) return;
+    if (selected.corrected.trim() === selected.airedText.trim()) {
+      this.pushToast('info', '上屏文本与当前稿一致', '没有需要补发的追改');
+      return;
+    }
+    const previous = cloneModel(this.model);
+    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = repackQueuedCorrections(queueCorrection(this.model, selected.id, selected.corrected));
+    this.persist();
+    this.pushToast('warning', '已登记追改', `第 ${selected.sequence} 段已上屏无法回改，新稿排入后面的窗口`);
+  }
+
+  private advancePlayhead(seconds: number): void {
+    this.automatic(advancePlayheadModel(this.model, seconds));
   }
 
   private addRuleFromSelection(): void {
@@ -608,7 +707,8 @@ export class CaptionDesk extends LitElement {
               <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
             </div>
             <p class="segment-text">${item.original}</p>
-            ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
+            ${item.airedText && item.airedText !== item.corrected ? html`<p class="segment-corrected locked">机房上屏：${item.airedText}</p><p class="segment-corrected">本地新稿：${item.corrected}</p>` : nothing}
+            ${!item.airedText && item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
             <div class="segment-foot">
               <span>${item.speaker}</span>
               <span>·</span>
@@ -617,6 +717,8 @@ export class CaptionDesk extends LitElement {
             </div>
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
+            ${item.state === 'suspended' ? html`<div class="issue-note suspended-note">机房播出日志没补齐，先挂起：${item.staleReason || '等机房补齐播出时刻后再定'}。</div>` : nothing}
+            ${item.state === 'aired' && item.airedText && item.corrected !== item.airedText ? html`<div class="issue-note locked-note">已上屏段落回改不了，可把新稿登记为追改排入后续窗口。</div>` : nothing}
           </button>
         `)}
       </div>
@@ -643,6 +745,16 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="editor-form">
+            ${item.state === 'aired' ? html`
+              <cds-inline-notification kind="info" low-contrast title="机房已上屏 · 段落锁定" subtitle="这一段已经在屏幕上播出，无法回改；下面的新稿只能作为追改排入后面的播出窗口。"></cds-inline-notification>
+              <div class="aired-box">
+                <span>机房上屏文本 · 播出时刻 ${formatClock(findEntry(this.model, item.id)?.airedAt ?? item.startTime)}</span>
+                <p style="margin:6px 0 0;">${item.airedText}</p>
+              </div>
+            ` : nothing}
+            ${item.state === 'suspended' ? html`
+              <cds-inline-notification kind="warning" low-contrast title="机房播出日志未补齐" subtitle="机房还没补回这一段的播出时刻，先挂起；日志补齐并对账后才能决定是正常投递还是转追改。"></cds-inline-notification>
+            ` : nothing}
             ${item.state === 'duplicate' ? html`
               <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${item.staleReason || '与已确认片段高度相似'}>
                 <cds-button slot="action" size="sm" @click=${this.recoverDuplicate}>保留并继续校对</cds-button>
@@ -652,7 +764,7 @@ export class CaptionDesk extends LitElement {
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
             <div class="form-grid">
-              <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
+              <cds-select label-text="发言人" value=${item.speaker} ?disabled=${item.state === 'aired'} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
                 ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
               </cds-select>
               <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
@@ -660,7 +772,7 @@ export class CaptionDesk extends LitElement {
             <cds-textarea
               class="caption-input"
               label-text="校对后的字幕文本"
-              helper-text="Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用"
+              helper-text=${item.state === 'aired' ? '上屏内容只读于机房，这里的改动将作为追改补发' : 'Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用'}
               .value=${item.corrected}
               @input=${(event: Event) => this.updateSelected({ corrected: (event.currentTarget as any).value }, '')}
             ></cds-textarea>
@@ -682,10 +794,22 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint">
+              ${item.state === 'aired'
+                ? html`<kbd>⌘/Ctrl Enter</kbd> 把新稿登记为追改 · 已上屏内容不会被改动`
+                : item.state === 'suspended'
+                  ? html`等机房补齐日志后，点右上“恢复并对账”重新排程`
+                  : html`<kbd>⌘/Ctrl Enter</kbd> 确认并排入播出窗口 · <kbd>Alt J/K</kbd> 切换片段`}
+            </div>
             <div>
-              <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              ${item.state === 'aired'
+                ? html`<cds-button kind="danger--tertiary" size="sm" disabled>已上屏锁定</cds-button>
+                  <cds-button kind="primary" @click=${this.queueCorrectionForSelected}>登记追改（排入后续窗口）</cds-button>`
+                : item.state === 'suspended'
+                  ? html`<cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
+                    <cds-button kind="primary" disabled>挂起中 · 等机房日志</cds-button>`
+                  : html`<cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
+                    <cds-button kind="primary" @click=${this.confirmSelected}>确认并排入窗口</cds-button>`}
             </div>
           </div>
         </div>
@@ -693,11 +817,107 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
+  private correctionLabel(status: string): string {
+    return { queued: '排队顺延', scheduled: '已排入窗口', suspended: '挂起', delivered: '已上屏' }[status] ?? status;
+  }
+
   private renderInspector() {
     const item = this.selected;
-    const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    const entries = [...this.model.machineEntries].sort((a, b) => a.airedAt - b.airedAt);
+    const windows = [...this.model.windows].sort((a, b) => a.index - b.index);
+    const corrections = [...this.model.corrections].sort((a, b) => a.createdAt - b.createdAt);
+    const segmentById = new Map(this.model.segments.map((segment) => [segment.id, segment]));
+    const suspendedCount = this.stats.suspended;
+    const queuedCorrections = corrections.filter((job) => job.status === 'queued').length;
+
+    const renderSlot = (window: BroadcastWindow, slotId: string) => {
+      const slot = parseSlot(slotId);
+      if (slot.kind === 'correction') {
+        const job = this.model.corrections.find((entry) => entry.id === slot.refId);
+        const segment = job ? segmentById.get(job.segmentId) : undefined;
+        return html`<span class="slot-chip correction ${window.end <= this.model.playhead ? 'past' : ''}" title="追改：${job?.text ?? ''}">改#${segment?.sequence ?? '?'}</span>`;
+      }
+      const segment = segmentById.get(slot.refId);
+      const past = window.end <= this.model.playhead;
+      return html`<span class="slot-chip delivery ${past ? 'past' : ''}" title=${segment?.corrected ?? ''}>#${segment?.sequence ?? '?'}</span>`;
+    };
+
     return html`
       <div class="inspector">
+        <section class="inspector-section">
+          <div class="inspector-section-head">
+            <h3>机房播出日志</h3>
+            <span>${entries.length} 条已上屏记录${suspendedCount ? ` · ${suspendedCount} 段等补日志` : ''}</span>
+          </div>
+          <div class="air-log">
+            ${entries.length ? entries.map((entry) => {
+              const segment = segmentById.get(entry.segmentId);
+              const drifted = segment && segment.airedText && entry.airedText.trim() !== segment.corrected.trim();
+              return html`
+                <article class="air-item ${drifted ? 'drifted' : ''}">
+                  <time>${formatClock(entry.airedAt)} · 第 ${this.model.windows.find((window) => window.id === entry.windowId)?.index ?? '?'} 档</time>
+                  <p>${entry.airedText}</p>
+                  <small>${segment ? `#${segment.sequence} · ${segment.speaker}` : entry.segmentId}${entry.note ? ` · ${entry.note}` : ''}${drifted ? ' · 与本地新稿不一致 → 需追改' : ''}</small>
+                </article>`;
+            }) : html`<div class="empty"><strong>机房还没有上屏记录</strong><p>恢复对账后，已上屏段落和播出时刻会出现在这里。</p></div>`}
+          </div>
+          ${suspendedCount > 0 ? html`
+            <div class="inspector-action">
+              <cds-button kind="primary" size="sm" @click=${this.completeMachineLogs}>机房补齐 ${suspendedCount} 段日志并重新对账</cds-button>
+            </div>` : nothing}
+        </section>
+
+        <section class="inspector-section">
+          <div class="inspector-section-head">
+            <h3>播出窗口排程</h3>
+            <span>播放头 ${formatClock(this.model.playhead)} · 容量封顶，已上屏不顶掉</span>
+          </div>
+          <div class="window-board">
+            ${windows.map((window) => {
+              const past = window.end <= this.model.playhead;
+              const live = window.start <= this.model.playhead && this.model.playhead < window.end;
+              const free = Math.max(0, window.capacity - window.scheduledIds.length);
+              return html`
+                <div class="window-row ${past ? 'past' : ''} ${live ? 'live' : ''}">
+                  <div class="window-meta">
+                    <strong>第 ${window.index} 档</strong>
+                    <span>${formatClock(window.start)}–${formatClock(window.end)}</span>
+                    <em>${window.scheduledIds.length}/${window.capacity}${past ? ' · 已结束' : live ? ' · 播出中' : ''}</em>
+                  </div>
+                  <div class="slot-row">
+                    ${window.scheduledIds.map((slotId) => renderSlot(window, slotId))}
+                    ${Array.from({ length: free }).map(() => html`<span class="slot-chip free">空槽</span>`)}
+                  </div>
+                </div>`;
+            })}
+          </div>
+          <div class="inspector-action">
+            <cds-button kind="ghost" size="sm" @click=${() => this.advancePlayhead(30)}>▶ 快进 30 秒（演示到期上屏）</cds-button>
+          </div>
+        </section>
+
+        <section class="inspector-section">
+          <div class="inspector-section-head">
+            <h3>追改队列</h3>
+            <span>${corrections.length} 条追改 · ${queuedCorrections} 条顺延排队</span>
+          </div>
+          <div class="correction-list">
+            ${corrections.length ? corrections.map((job) => {
+              const segment = segmentById.get(job.segmentId);
+              const windowIndex = this.model.windows.find((window) => window.id === job.scheduledWindowId)?.index;
+              return html`
+                <article class="correction-item ${job.status}">
+                  <div class="correction-head">
+                    <strong>#${segment?.sequence ?? '?'} 的追改</strong>
+                    <span class="correction-status ${job.status}">${this.correctionLabel(job.status)}${windowIndex ? ` · 第 ${windowIndex} 档` : ''}</span>
+                  </div>
+                  <p>${job.text}</p>
+                  ${job.holdReason ? html`<small>${job.holdReason}</small>` : nothing}
+                </article>`;
+            }) : html`<div class="empty"><strong>没有待补发的改动</strong><p>已上屏段落若本地又有新稿，会在这里排队，顺延进入后面的窗口。</p></div>`}
+          </div>
+        </section>
+
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>术语快捷规则</h3>
@@ -731,30 +951,14 @@ export class CaptionDesk extends LitElement {
 
         <section class="inspector-section">
           <div class="inspector-section-head">
-            <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
-          </div>
-          <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
-              </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
-          </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
-        </section>
-
-        <section class="inspector-section">
-          <div class="inspector-section-head">
             <h3>当前片段上下文</h3>
             <span>${item ? `#${item.sequence}` : '未选择'}</span>
           </div>
           <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
-              <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
+              <div style="margin-top: 8px;"><strong>本地校对稿：</strong>${item.corrected}</div>
+              ${item.airedText ? html`<div style="margin-top: 8px; color: #525252;"><strong>机房上屏稿：</strong>${item.airedText}</div>` : nothing}
               <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
@@ -780,7 +984,7 @@ export class CaptionDesk extends LitElement {
             <span class="connection-dot"></span>
             <div class="connection-copy">
               <strong>${connectionLabel(this.model.connection)} · ${this.model.simulatedDelay.toFixed(1)} 秒延迟</strong>
-              <small>${this.model.connection === 'offline' ? '仍可编辑，确认内容进入离线发件箱' : `待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
+              <small>${this.model.connection === 'offline' ? '仍可校对，恢复后与机房对账：已上屏锁定、缺日志挂起' : `待确认 ${stats.pending} 段 · 追改排队 ${stats.correctionQueued} · 自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
             </div>
           </div>
           <div class="header-actions">
@@ -793,14 +997,14 @@ export class CaptionDesk extends LitElement {
 
         <section class="status-strip">
           <div class="status-cell hero">
-            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <strong>${this.model.connection === 'offline' ? '断网中：继续校对，恢复后与机房对账' : stats.backlog > 8 ? '队列积压，挂起段等机房日志、追改正顺延排队' : '两边节奏正常，已上屏段落锁定不回改'}</strong>
+            <span>待确认 ${stats.pending} · 挂起 ${stats.suspended} · 已上屏 ${stats.aired} · 追改待排 ${stats.correctionQueued} · 已排窗 ${stats.correctionScheduled}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
-          <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
-          <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
-          <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
-          <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
+          <div class="status-cell"><strong>${stats.pending}</strong><span>待确认草稿</span></div>
+          <div class="status-cell warning"><strong>${stats.suspended}</strong><span>等机房补日志挂起</span></div>
+          <div class="status-cell danger"><strong>${stats.correctionQueued + stats.correctionScheduled}</strong><span>追改排队 / 已排窗</span></div>
+          <div class="status-cell"><strong>${stats.aired}</strong><span>机房已上屏锁定</span></div>
           <div class="font-controls">
             <label>字幕字号</label>
             <cds-button kind="ghost" size="sm" @click=${() => this.adjustFont(-1)}>A−</cds-button>
@@ -814,7 +1018,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>待确认区</h2>
-                <p>按收到顺序排列，重复和过期内容不会被静默覆盖</p>
+                <p>校对员的草稿这一半；机房日志缺失的段落挂起等待</p>
               </div>
               <cds-dropdown value=${this.filter} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.filter = event.detail.item.value as typeof this.filter; }}>
                 <cds-dropdown-item value="active">仅需处理</cds-dropdown-item>
@@ -839,11 +1043,11 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>规则与机房对账</h2>
+                <p>机房持有已上屏字幕和播出时刻；恢复后双边对账，错过窗口的改动顺延</p>
               </div>
               ${this.model.connection === 'offline'
-                ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
+                ? html`<cds-button kind="primary" size="sm" @click=${this.reconcile}>恢复并对账</cds-button>`
                 : html`<cds-button kind="danger--tertiary" size="sm" @click=${() => this.setConnection('offline')}>模拟断线</cds-button>`}
             </div>
             <div class="column-body">${this.renderInspector()}</div>
