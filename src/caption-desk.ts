@@ -4,12 +4,17 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
-  mergeConfirmedSegments,
+  currentWindowIndex,
   normalizeNumbers,
   queueStats,
+  reconcile,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
+  WINDOW_CAPACITY,
+  WINDOW_INTERVAL_MS,
+  windowIndexForSegment,
+  type BroadcastWindow,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
@@ -38,6 +43,8 @@ function stateLabel(state: SegmentState): string {
     duplicate: '重复片段',
     stale: '过期修改',
     ignored: '已忽略',
+    aired: '已上屏',
+    suspended: '挂起',
   }[state];
 }
 
@@ -174,6 +181,14 @@ export class CaptionDesk extends LitElement {
     .segment-foot b { color: #0f62fe; font-weight: 500; }
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
+    .suspended-note { background: #f4f4f4; border-color: #8d8d8d; color: #525252; }
+    .deferred-note { background: #fff8e1; border-color: #f1c21b; color: #684e00; }
+    .draft-note { margin-top: 8px; padding: 7px 8px; background: #f4f4f4; border-left: 2px solid #8d8d8d; color: #525252; font-size: 10px; line-height: 1.45; }
+
+    .segment-card.aired { border-left-color: #198038; }
+    .segment-card.suspended { border-left-color: #8d8d8d; background: color-mix(in srgb, #fff 94%, #8d8d8d 6%); }
+    .segment-state.aired { color: #198038; }
+    .segment-state.suspended { color: #6f6f6f; }
 
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
@@ -217,6 +232,23 @@ export class CaptionDesk extends LitElement {
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .delivery-status.suspended { background: #f4f4f4; border-left-color: #8d8d8d; color: #525252; }
+
+    .window-list { padding: 6px 0; }
+    .window-row { padding: 8px 11px; border-left: 3px solid #0f62fe; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
+    .window-row.current { border-left-color: #42be65; }
+    .window-row.past { opacity: .68; }
+    .window-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .window-meta strong { font-size: 11px; }
+    .window-meta span { color: var(--cds-text-secondary, #525252); font: 500 9px/1 "IBM Plex Mono", monospace; }
+    .window-track { width: 100%; height: 3px; margin-top: 6px; background: #e0e0e0; }
+    .window-track > span { display: block; height: 100%; background: #0f62fe; transition: width .3s ease; }
+    .window-row.current .window-track > span { background: #42be65; }
+    .window-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 5px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .window-foot .deferred { color: #b28600; }
+    .live-item.aired { border-left-color: #198038; }
+    .live-item.scheduled { border-left-color: #0f62fe; }
+    .draft-miss { color: #b28600 !important; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -255,8 +287,13 @@ export class CaptionDesk extends LitElement {
     window.addEventListener('keydown', this.handleShortcut);
     this.ticker = window.setInterval(() => {
       const next = simulateLatency(this.model);
-      const changed = JSON.stringify(next.segments) !== JSON.stringify(this.model.segments) || next.connection !== this.model.connection;
-      if (!changed) return;
+      const signature = (m: DeskModel) => [
+        m.connection,
+        m.broadcastLog.length,
+        m.airedWindowIds.length,
+        m.segments.map((item) => `${item.id}:${item.state}:${item.deferredToWindowId ?? ''}`).join(','),
+      ].join('|');
+      if (signature(next) === signature(this.model)) return;
       this.model = next;
       this.persist();
     }, 5_000);
@@ -335,8 +372,8 @@ export class CaptionDesk extends LitElement {
 
   private get pendingSegments(): CaptionSegment[] {
     const items = this.model.segments.filter((item) => {
-      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
-      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
+      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate' || item.state === 'suspended';
+      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate' || item.state === 'suspended';
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
@@ -485,14 +522,21 @@ export class CaptionDesk extends LitElement {
     }));
   }
 
-  private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
+  private reconcileOffline(): void {
+    const result = reconcile(this.model);
     this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
     this.future = [];
-    this.model = merged;
+    this.model = result.model;
     this.persist();
-    const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    const parts: string[] = [];
+    if (result.aired) parts.push(`新上屏 ${result.aired} 段`);
+    if (result.deferred) parts.push(`顺延 ${result.deferred} 段`);
+    if (result.suspended) parts.push(`挂起 ${result.suspended} 段`);
+    this.pushToast(
+      result.aired || result.deferred || result.suspended ? 'success' : 'info',
+      '已恢复并与机房对账',
+      parts.length ? parts.join('，') : '播出日志已同步，无顺延或挂起',
+    );
   }
 
   private addRuleFromSelection(): void {
@@ -617,6 +661,8 @@ export class CaptionDesk extends LitElement {
             </div>
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
+            ${item.state === 'suspended' ? html`<div class="issue-note suspended-note">${item.staleReason || '机房播出日志未补齐'}，暂不可编辑，等机房补齐后自动确认。</div>` : nothing}
+            ${item.state === 'pending' && item.deferredToWindowId ? html`<div class="issue-note deferred-note">${item.staleReason || '已顺延至后续窗口'}，确认后按新窗口排期上屏。</div>` : nothing}
           </button>
         `)}
       </div>
@@ -629,6 +675,7 @@ export class CaptionDesk extends LitElement {
       return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
     }
     const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
+    const locked = item.state === 'aired' || item.state === 'suspended';
     return html`
       <div class="editor-scroll">
         <div class="editor-card">
@@ -638,7 +685,7 @@ export class CaptionDesk extends LitElement {
               <p class="editor-title">实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
             </div>
             <div class="editor-status">
-              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
+              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : item.state === 'aired' ? 'green' : item.state === 'suspended' ? 'gray' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
               <cds-tag type="outline" size="sm">修改 ${item.revision} 次</cds-tag>
             </div>
           </div>
@@ -651,41 +698,53 @@ export class CaptionDesk extends LitElement {
             ${item.state === 'stale' ? html`
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
+            ${item.state === 'aired' ? html`
+              <cds-inline-notification kind="success" low-contrast title="已上屏，内容不可更改" subtitle=${item.staleReason || '该段已由机房播出，回改不了。如需更正，请在后续窗口重新排档。'}></cds-inline-notification>
+            ` : nothing}
+            ${item.state === 'suspended' ? html`
+              <cds-inline-notification kind="warning" low-contrast title="挂起，待机房补齐日志" subtitle=${item.staleReason || '机房播出日志未补齐，暂不可编辑；日志补齐后会自动确认上屏。'}></cds-inline-notification>
+            ` : nothing}
             <div class="form-grid">
-              <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
+              <cds-select label-text="发言人" value=${item.speaker} ?disabled=${locked} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
                 ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
               </cds-select>
               <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
             </div>
             <cds-textarea
               class="caption-input"
-              label-text="校对后的字幕文本"
-              helper-text="Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用"
-              .value=${item.corrected}
+              label-text=${item.state === 'aired' ? '已上屏字幕文本（只读）' : '校对后的字幕文本'}
+              helper-text=${item.state === 'aired' ? '该段已上屏，内容以机房播出稿为准' : 'Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用'}
+              .value=${item.state === 'aired' ? (item.airedContent ?? item.corrected) : item.corrected}
+              ?readonly=${locked}
               @input=${(event: Event) => this.updateSelected({ corrected: (event.currentTarget as any).value }, '')}
             ></cds-textarea>
+            ${item.state === 'aired' && item.corrected !== (item.airedContent ?? item.corrected) ? html`
+              <div class="draft-note">校对稿（未及播出）：${item.corrected}</div>
+            ` : nothing}
             <div class="edit-toolbar">
               <span>快速标点</span>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('，')}>，逗号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('。')}>。句号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('？')}>？问号</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.insertPunctuation('…')}>…省略</cds-button>
-              <cds-button kind="ghost" size="sm" @click=${() => this.wrapSelection('（', '）')}>（）括注</cds-button>
-              <cds-button kind="secondary" size="sm" @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${locked} @click=${() => this.insertPunctuation('，')}>，逗号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${locked} @click=${() => this.insertPunctuation('。')}>。句号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${locked} @click=${() => this.insertPunctuation('？')}>？问号</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${locked} @click=${() => this.insertPunctuation('…')}>…省略</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${locked} @click=${() => this.wrapSelection('（', '）')}>（）括注</cds-button>
+              <cds-button kind="secondary" size="sm" ?disabled=${locked} @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
             </div>
             <div class="rule-suggestions">
               <small>术语快捷替换</small>
               ${applicableRules.length ? applicableRules.map((rule) => html`
-                <cds-button kind="tertiary" size="sm" @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
+                <cds-button kind="tertiary" size="sm" ?disabled=${locked} @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
               `) : html`<small>当前发言人的规则为空</small>`}
-              <cds-button kind="ghost" size="sm" @click=${this.addRuleFromSelection}>＋ 从当前文本新建</cds-button>
+              <cds-button kind="ghost" size="sm" ?disabled=${locked} @click=${this.addRuleFromSelection}>＋ 从当前文本新建</cds-button>
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint">
+              ${item.state === 'aired' ? '已上屏 · 内容不可更改' : item.state === 'suspended' ? '挂起中 · 等机房补齐播出日志' : html`<kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段`}
+            </div>
             <div>
-              <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              <cds-button kind="danger--tertiary" size="sm" ?disabled=${locked} @click=${this.ignoreSelected}>忽略片段</cds-button>
+              <cds-button kind="primary" ?disabled=${locked} @click=${this.confirmSelected}>${item.state === 'aired' ? '已上屏' : item.state === 'suspended' ? '挂起中' : '确认并送入直播区'}</cds-button>
             </div>
           </div>
         </div>
@@ -695,7 +754,33 @@ export class CaptionDesk extends LitElement {
 
   private renderInspector() {
     const item = this.selected;
-    const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    const aired = this.model.segments
+      .filter((segment) => segment.state === 'aired')
+      .sort((a, b) => (a.airedAt ?? a.startTime) - (b.airedAt ?? b.startTime));
+    const scheduled = this.model.segments
+      .filter((segment) => segment.state === 'confirmed')
+      .sort((a, b) => a.startTime - b.startTime);
+    const now = Date.now();
+    const currentIdx = currentWindowIndex(this.model, now);
+    const interval = WINDOW_INTERVAL_MS;
+    const windowRows: { win: BroadcastWindow; assigned: number; deferred: number; airedCount: number }[] = [];
+    for (let i = Math.max(0, currentIdx - 1); i <= currentIdx + 5; i += 1) {
+      const win = this.model.windows.find((w) => w.index === i) ?? {
+        id: `win-${i}`,
+        index: i,
+        startTime: this.model.scheduleStartAt + i * interval,
+        capacity: WINDOW_CAPACITY,
+      };
+      const due = this.model.segments.filter((segment) => {
+        if (segment.state === 'ignored' || segment.state === 'aired') return false;
+        const ownIdx = windowIndexForSegment(segment, interval);
+        return ownIdx === i || segment.deferredToWindowId === win.id;
+      });
+      const assigned = due.length;
+      const deferred = due.filter((segment) => segment.deferredToWindowId === win.id && windowIndexForSegment(segment, interval) !== i).length;
+      const airedCount = this.model.broadcastLog.filter((record) => record.windowId === win.id && record.complete).length;
+      windowRows.push({ win, assigned, deferred, airedCount });
+    }
     return html`
       <div class="inspector">
         <section class="inspector-section">
@@ -731,19 +816,58 @@ export class CaptionDesk extends LitElement {
 
         <section class="inspector-section">
           <div class="inspector-section-head">
+            <h3>播出窗口排期</h3>
+            <span>每档容量 ${WINDOW_CAPACITY} 段 · 装不下顺延</span>
+          </div>
+          <div class="window-list">
+            ${windowRows.map(({ win, assigned, deferred, airedCount }) => {
+              const loadRatio = Math.min(100, (assigned / win.capacity) * 100);
+              const isPast = win.index < currentIdx;
+              const isCurrent = win.index === currentIdx;
+              return html`
+                <div class="window-row ${isCurrent ? 'current' : ''} ${isPast ? 'past' : ''}">
+                  <div class="window-meta">
+                    <strong>第 ${win.index + 1} 档${isCurrent ? ' · 进行中' : ''}</strong>
+                    <span>${new Date(win.startTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                  </div>
+                  <div class="window-track"><span style=${`width:${loadRatio}%`}></span></div>
+                  <div class="window-foot">
+                    ${isPast
+                      ? html`<span>已上屏 ${airedCount} 段</span>`
+                      : html`<span>已排 ${assigned} / ${win.capacity} 段</span>`}
+                    ${deferred ? html`<span class="deferred">顺延 ${deferred}</span>` : nothing}
+                  </div>
+                </div>
+              `;
+            })}
+          </div>
+        </section>
+
+        <section class="inspector-section">
+          <div class="inspector-section-head">
             <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
+            <span>${aired.length} 段已上屏 · ${scheduled.length} 段待播出</span>
           </div>
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
-              </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            ${aired.length || scheduled.length ? html`
+              ${aired.slice(-8).reverse().map((segment) => html`
+                <article class="live-item aired">
+                  <time>${formatClock(segment.startTime)} · ${segment.speaker} · 已上屏</time>
+                  <p>${segment.airedContent ?? segment.corrected}</p>
+                  ${segment.corrected !== (segment.airedContent ?? segment.corrected) ? html`<small class="draft-miss">校对稿未及播出，以机房播出稿为准</small>` : nothing}
+                </article>
+              `)}
+              ${scheduled.slice(-6).reverse().map((segment) => html`
+                <article class="live-item scheduled">
+                  <time>${formatClock(segment.startTime)} · ${segment.speaker} · 待播出</time>
+                  <p>${segment.corrected}</p>
+                  ${segment.deferredToWindowId ? html`<small class="draft-miss">已顺延至后续窗口</small>` : segment.source === 'offline' ? html`<small>离线来源 · 恢复后对账</small>` : nothing}
+                </article>
+              `)}
+            ` : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会按窗口排期上屏。</p></div>`}
           </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.stats.suspended > 0 ? html`<div class="delivery-status suspended">${this.stats.suspended} 段挂起，等机房补齐播出日志后自动确认上屏。</div>` : nothing}
+          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待对账。恢复连接后按窗口排期提交，不会顶掉已上屏内容。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -754,7 +878,8 @@ export class CaptionDesk extends LitElement {
           <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
-              <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
+              <div style="margin-top: 8px;"><strong>校对稿：</strong>${item.corrected}</div>
+              ${item.airedContent ? html`<div style="margin-top: 8px; color: #198038;"><strong>已上屏内容：</strong>${item.airedContent}</div>` : nothing}
               <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
@@ -794,13 +919,13 @@ export class CaptionDesk extends LitElement {
         <section class="status-strip">
           <div class="status-cell hero">
             <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <span>待确认 ${stats.pending} · 已上屏 ${stats.aired} · 挂起 ${stats.suspended} · 异常 ${stats.stale + stats.duplicate} · 最长等待 ${stats.oldestWaitSeconds}s</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
-          <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
+          <div class="status-cell"><strong>${stats.aired}</strong><span>已上屏段落</span></div>
+          <div class="status-cell warning"><strong>${stats.suspended}</strong><span>挂起待日志</span></div>
           <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
-          <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
             <label>字幕字号</label>
             <cds-button kind="ghost" size="sm" @click=${() => this.adjustFont(-1)}>A−</cds-button>
@@ -839,11 +964,11 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>规则与播出区</h2>
+                <p>确认后按窗口排期上屏；已上屏回改不了，顺延内容不顶掉已播段落</p>
               </div>
               ${this.model.connection === 'offline'
-                ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
+                ? html`<cds-button kind="primary" size="sm" @click=${this.reconcileOffline}>恢复并对账</cds-button>`
                 : html`<cds-button kind="danger--tertiary" size="sm" @click=${() => this.setConnection('offline')}>模拟断线</cds-button>`}
             </div>
             <div class="column-body">${this.renderInspector()}</div>

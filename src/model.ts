@@ -1,5 +1,5 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
-export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
+export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored' | 'aired' | 'suspended';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
 export interface CaptionSegment {
@@ -8,6 +8,9 @@ export interface CaptionSegment {
   startTime: number;
   receivedAt: number;
   confirmedAt?: number;
+  airedAt?: number;
+  airedContent?: string;
+  deferredToWindowId?: string;
   speaker: string;
   original: string;
   corrected: string;
@@ -18,6 +21,23 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+}
+
+/** 播出窗口：每档窗口有容量封顶，装不下的片段排队顺延。 */
+export interface BroadcastWindow {
+  id: string;
+  index: number;
+  startTime: number;
+  capacity: number;
+}
+
+/** 机房播出日志条目；complete 为 false 表示日志没补齐，片段先挂起。 */
+export interface AiredRecord {
+  segmentId: string;
+  windowId: string;
+  airedAt: number;
+  content: string;
+  complete: boolean;
 }
 
 export interface TermRule {
@@ -43,6 +63,11 @@ export interface DeskModel {
   nextSequence: number;
   autoStream: boolean;
   lastMergedAt?: number;
+  /** 播出排期起点（真实时间戳），窗口按此时刻对齐。 */
+  scheduleStartAt: number;
+  windows: BroadcastWindow[];
+  broadcastLog: AiredRecord[];
+  airedWindowIds: string[];
   updatedAt: number;
 }
 
@@ -52,6 +77,11 @@ export interface ToastMessage {
   title: string;
   subtitle: string;
 }
+
+/** 每档播出窗口的时长（毫秒）。 */
+export const WINDOW_INTERVAL_MS = 30_000;
+/** 每档窗口容量封顶（段数），装不下的排队顺延。 */
+export const WINDOW_CAPACITY = 3;
 
 const now = Date.now();
 export const STORAGE_KEY = 'sologsb-1011-live-caption-desk-v1';
@@ -115,12 +145,162 @@ export function createInitialModel(): DeskModel {
     fontSize: 18,
     nextSequence: 9,
     autoStream: true,
+    scheduleStartAt: now,
+    windows: [],
+    broadcastLog: [],
+    airedWindowIds: [],
     updatedAt: now,
   };
 }
 
 export function cloneModel(model: DeskModel): DeskModel {
   return structuredClone(model);
+}
+
+/** 片段内容时刻落在第几档窗口（从 0 开始）。 */
+export function windowIndexForSegment(segment: CaptionSegment, interval = WINDOW_INTERVAL_MS): number {
+  return Math.max(0, Math.floor((segment.startTime * 1000) / interval));
+}
+
+/** 当前真实时间对应第几档窗口。 */
+export function currentWindowIndex(model: DeskModel, now: number, interval = WINDOW_INTERVAL_MS): number {
+  return Math.max(0, Math.floor((now - model.scheduleStartAt) / interval));
+}
+
+/** 取第 index 档窗口，缺失则补建（窗口按排期起点对齐）。 */
+export function ensureWindow(windows: BroadcastWindow[], scheduleStartAt: number, index: number): BroadcastWindow {
+  const existing = windows.find((item) => item.index === index);
+  if (existing) return existing;
+  const win = { id: `win-${index}`, index, startTime: scheduleStartAt + index * WINDOW_INTERVAL_MS, capacity: WINDOW_CAPACITY };
+  windows.push(win);
+  return win;
+}
+
+/**
+ * 机房照常上屏：处理所有已到点的窗口，把窗口内片段按容量上屏并写入播出日志。
+ * 容量封顶，装不下的片段顺延到下一档窗口；已上屏的片段不会被顶掉。
+ * 断线时也会执行（机房不受影响），但校对侧视图不更新，等恢复后对账。
+ */
+export function processWindows(model: DeskModel, now: number): DeskModel {
+  const scheduleStart = model.scheduleStartAt;
+  if (!scheduleStart) return model;
+  const interval = WINDOW_INTERVAL_MS;
+  const cap = WINDOW_CAPACITY;
+  const currentIdx = Math.floor((now - scheduleStart) / interval);
+  if (currentIdx < 0) return model;
+
+  const windows: BroadcastWindow[] = [];
+  for (let i = 0; i <= currentIdx + 2; i += 1) {
+    windows.push(model.windows.find((item) => item.index === i) ?? {
+      id: `win-${i}`,
+      index: i,
+      startTime: scheduleStart + i * interval,
+      capacity: cap,
+    });
+  }
+  const log = [...model.broadcastLog];
+  const airedWindowIds = [...model.airedWindowIds];
+  const segments = model.segments.map((item) => ({ ...item }));
+
+  for (let i = 0; i <= currentIdx; i += 1) {
+    const win = windows[i];
+    if (airedWindowIds.includes(win.id)) continue;
+    const due = segments.filter((item) => {
+      if (item.state === 'ignored' || item.state === 'aired') return false;
+      const ownIdx = windowIndexForSegment(item, interval);
+      return ownIdx === i || item.deferredToWindowId === win.id;
+    }).sort((a, b) => a.sequence - b.sequence);
+
+    if (due.length) {
+      const toAir = due.slice(0, cap);
+      const deferred = due.slice(cap);
+      for (const item of toAir) {
+        const content = item.state === 'confirmed' ? item.corrected : item.original;
+        log.push({ segmentId: item.id, windowId: win.id, airedAt: now, content, complete: Math.random() > 0.25 });
+      }
+      for (const item of deferred) {
+        const next = windows[i + 1] ?? ensureWindow(windows, scheduleStart, i + 1);
+        item.deferredToWindowId = next.id;
+        item.staleReason = `第 ${i + 1} 档窗口容量已满，顺延至第 ${i + 2} 档窗口`;
+      }
+    }
+    airedWindowIds.push(win.id);
+  }
+
+  // 机房播出日志陆续补齐：未完成的条目有概率在后续轮次补全。
+  for (const record of log) {
+    if (!record.complete && Math.random() > 0.55) record.complete = true;
+  }
+
+  return { ...model, segments, windows, broadcastLog: log, airedWindowIds };
+}
+
+/**
+ * 按机房播出日志更新校对侧视图：
+ * - 有完整上屏记录 → 已上屏（回改不了，校对稿未及播出则标注以机房播出稿为准）；
+ * - 日志没补齐 → 挂起，等机房补齐再定；
+ * - 已确认但错过窗口 → 顺延到后续窗口，不顶掉已上屏内容。
+ */
+export function applyBroadcastLog(model: DeskModel, now: number): DeskModel {
+  const interval = WINDOW_INTERVAL_MS;
+  const currentIdx = currentWindowIndex(model, now, interval);
+  const segments = model.segments.map((item) => ({ ...item }));
+
+  for (const item of segments) {
+    if (item.state === 'ignored') continue;
+    const complete = model.broadcastLog.find((record) => record.segmentId === item.id && record.complete);
+    if (complete) {
+      item.state = 'aired';
+      item.airedAt = complete.airedAt;
+      item.airedContent = complete.content;
+      item.deferredToWindowId = undefined;
+      item.staleReason = item.corrected !== complete.content ? '已上屏，校对稿未及播出，内容以机房播出稿为准' : undefined;
+      continue;
+    }
+    const incomplete = model.broadcastLog.find((record) => record.segmentId === item.id && !record.complete);
+    if (incomplete) {
+      item.state = 'suspended';
+      item.staleReason = '机房播出日志未补齐，待日志补齐后确认';
+      continue;
+    }
+    // 没有上屏记录：窗口已过则按是否已确认分别处理。
+    const ownIdx = windowIndexForSegment(item, interval);
+    const windowPassed = ownIdx < currentIdx;
+    if (item.state === 'confirmed' && windowPassed && !item.deferredToWindowId) {
+      const nextIdx = Math.max(ownIdx + 1, currentIdx + 1);
+      item.deferredToWindowId = `win-${nextIdx}`;
+      item.staleReason = `错过第 ${ownIdx + 1} 档窗口，已顺延至第 ${nextIdx + 1} 档窗口`;
+    } else if (item.state === 'pending' && windowPassed && !item.deferredToWindowId) {
+      item.state = 'stale';
+      item.staleReason = `第 ${ownIdx + 1} 档窗口已过，未上屏`;
+    }
+  }
+  return { ...model, segments };
+}
+
+/** 恢复连接后与机房对账：合并离线发件箱、补齐窗口、按日志更新视图并顺延错过的片段。 */
+export function reconcile(model: DeskModel): { model: DeskModel; aired: number; suspended: number; deferred: number } {
+  const now = Date.now();
+  let next = mergeConfirmedSegments(model);
+  // 离线确认的片段若因合并且延迟被标记为 stale，恢复为 confirmed 以便重新排档。
+  next = {
+    ...next,
+    segments: next.segments.map((item) => (
+      item.state === 'stale' && item.source === 'offline'
+        ? { ...item, state: 'confirmed', staleReason: undefined }
+        : item
+    )),
+  };
+  next = processWindows(next, now);
+  const beforeAired = next.segments.filter((item) => item.state === 'aired').length;
+  next = applyBroadcastLog(next, now);
+  const afterAired = next.segments.filter((item) => item.state === 'aired').length;
+  return {
+    model: { ...next, connection: 'connected', lastMergedAt: now, updatedAt: now },
+    aired: afterAired - beforeAired,
+    suspended: next.segments.filter((item) => item.state === 'suspended').length,
+    deferred: next.segments.filter((item) => !!item.deferredToWindowId && item.state !== 'aired').length,
+  };
 }
 
 export function normalizeNumbers(text: string): string {
@@ -226,12 +406,16 @@ export function queueStats(model: DeskModel) {
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const aired = model.segments.filter((item) => item.state === 'aired');
+  const suspended = model.segments.filter((item) => item.state === 'suspended');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
-    backlog: pending.length + stale.length + duplicate.length + offline.length,
+    aired: aired.length,
+    suspended: suspended.length,
+    backlog: pending.length + stale.length + duplicate.length + offline.length + suspended.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
 }
@@ -264,7 +448,11 @@ export function createLiveSegment(sequence: number): CaptionSegment {
 }
 
 export function simulateLatency(model: DeskModel): DeskModel {
-  if (model.connection === 'offline') return model;
+  const now = Date.now();
+  if (model.connection === 'offline') {
+    // 离线：机房照常上屏（播出日志持续累积），校对侧视图保持陈旧，等恢复后对账。
+    return processWindows(model, now);
+  }
   const step = model.connection === 'degraded' ? 0.7 : model.simulatedDelay > 2.8 ? -0.3 : 0.15;
   const delay = Math.max(0.7, Math.min(8.9, Number((model.simulatedDelay + step).toFixed(1))));
   const applyStream = model.autoStream && Math.random() > 0.68;
@@ -276,18 +464,21 @@ export function simulateLatency(model: DeskModel): DeskModel {
     segments = [...segments, duplicate ? { ...candidate, state: 'duplicate', duplicateOf: duplicate.id, staleReason: `与第 ${duplicate.sequence} 段重复` } : candidate];
     nextSequence += 1;
   }
-  const pendingCutoff = Date.now() - 90_000;
+  const pendingCutoff = now - 90_000;
   segments = segments.map((item) => item.state === 'pending' && item.receivedAt < pendingCutoff
-    ? { ...item, state: 'stale', staleReason: `片段已等待 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` }
+    ? { ...item, state: 'stale', staleReason: `片段已等待 ${Math.round((now - item.receivedAt) / 1000)} 秒` }
     : item);
-  return {
+  let next: DeskModel = {
     ...model,
     segments,
     nextSequence,
     simulatedDelay: delay,
     connection: delay > 4.2 ? 'degraded' : model.connection,
-    updatedAt: Date.now(),
+    updatedAt: now,
   };
+  next = processWindows(next, now);
+  next = applyBroadcastLog(next, now);
+  return next;
 }
 
 export function toSrt(model: DeskModel): string {
@@ -299,8 +490,8 @@ export function toSrt(model: DeskModel): string {
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}${separator}${String(millis).padStart(3, '0')}`;
   };
   return model.segments
-    .filter((item) => item.state === 'confirmed')
+    .filter((item) => item.state === 'aired' || item.state === 'confirmed')
     .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.airedContent ?? item.corrected}\n`)
     .join('\n');
 }
